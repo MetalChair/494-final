@@ -52,7 +52,10 @@ function onSerialData(data){
 
 //Sets up arduino board for serial listening
 async function setupSerial(){
-   var path =  await getArduinoPort();
+   var path =  await getArduinoPort().catch(() =>{
+     console.warn("No serial devices found")
+     process.exit()
+   });
    if(!path){
        console.warn("Could not find Arduino device");
        process.exit();
