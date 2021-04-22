@@ -9,6 +9,7 @@ const open = require("open");
 const wsServer = new WebSocket.Server({
   server: server
 });
+app.use(express.static("assets"));
 
 let duinoPort;
 let sockets = [];
@@ -29,8 +30,7 @@ wsServer.on('connection', function(socket) {
 });
 
 //Definitions for express api
-app.get('/', (req, res) => res.sendFile( path.join(__dirname, "/index.html")));
-
+app.get('/*', (req, res) => res.sendFile( path.join(__dirname, "/index.html")));
 
 
 //Defintions for serial getter

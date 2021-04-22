@@ -13,7 +13,7 @@ void setup(){
 }
 
 void loop(){
-  
+
   value = analogRead(flexPin);         //Read and save analog value from potentiometer
   Serial.println(value);               //Print value
   delay(100);//Small delay
