@@ -14,7 +14,6 @@
     font-size: 120%;
 }
 .sidebar > .collection{
-    border: 0;
     border-left: 0;
     border-right: 0;
     border-radius: 0;
@@ -34,7 +33,7 @@
     display: block;
 }
 .sidebar .brand{
-    min-height: 7%;
+    min-height: 7.5vh;
     text-align: center;
     display: flex;
     justify-content: center;
@@ -75,4 +74,11 @@ span{
 .hidden{
     opacity: 0;
 }
-
+.workouts-container{
+    padding-left: 1em;
+}
+.workouts-card-container{
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+}

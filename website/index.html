@@ -1,77 +1,17 @@
 <!DOCTYPE html>
 <head>
     <head>
+        <script src="https://unpkg.com/page/page.js"></script>
         <!-- Compiled and minified CSS -->
      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css">
      <!-- Compiled and minified JavaScript -->
      <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
     <link rel="stylesheet" type="text/css" href="./style.css">
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-    <script src="https://unpkg.com/page@1.11.6/page.js"></script>
     <base href=  "/">
 </head>
     <title>Workout Tracker</title>
 </head>
 <body>
-    <div class = "content-container">
-        <div class = "sidebar z-depth-1">
-            <div class = "brand teal lighten-1 white-text">
-                <b>Wearable Fitness Tracker</b>
-            </div>
-            <ul class = "collection">
-                <a href = "/">
-                <li class ="collection-item" id = "home-button">
-                    <span class="material-icons">
-                        home
-                    </span>
-                    Home
-                </li>
-                </a>
-                <a href = "./workouts">
-                    <li class ="collection-item" id = "workouts-button">
-                        <span class="material-icons">
-                            fitness_center
-                            </span>
-                        Workouts
-                    </li>
-                </a>
-                <a href = "./live-readout">
-                    <li class ="collection-item" id = "live-reading">
-                        <span class="material-icons">
-                            whatshot
-                            </span>
-                        Live Readout
-                    </li>
-                </a>
-                <a  href = "./settings">
-                    <li class ="collection-item" id= "settings-button">
-                        <span class="material-icons">
-                            settings
-                        </span>
-                    Settings
-                    </li>
-                </a>
-            </ul>
-        </div>
-        <div class = "content  grey lighten-5">
-            <div class = "readout-container" id = "live-readout-content">
-                <b id = "big-flex-number">
-                    0
-                </b>
-                <b id = "big-flex-sub">Flexion</b>
-            </div>
-        </div>
-    </div>
 </body>
-
-
-<script>
-window.timeouts = [];
-
-    let currentFlex = 0;
-    let socket = new WebSocket("ws://localhost:3000");
-    socket.onmessage = (event) =>{
-        currentFlex = event.data;
-    }
-</script>
 <script src  = "./script.js"></script>    
