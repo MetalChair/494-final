@@ -5,7 +5,8 @@
     import CreateWorkout from "./components/create-workout.svelte";
     import ViewWorkouts from "./components/view-workouts.svelte";
     import {v4 as uuidv4} from 'uuid'
-import WorkoutRunner from "./components/workout-runner.svelte";
+    import WorkoutRunner from "./components/workout-runner.svelte";
+    import workout_template from "./components/workout-template";
 
     //Define new routes here
     const routes = [
@@ -71,17 +72,14 @@ import WorkoutRunner from "./components/workout-runner.svelte";
     ]
 
     function createWorkout(ctx, next){
+        localStorage.clear("active_workout")
         let id = uuidv4();
         ctx.id = id;
         let curr = JSON.parse(localStorage.getItem("routine_list"));
         if(!curr){
             curr = {}
         }
-        curr[id] = JSON.stringify({
-            "name" : "My Cool Workout",
-            "activities" : [],
-            "times_performed": 0
-        });
+        curr[id] = JSON.stringify(workout_template);
         localStorage.setItem("routine_list", JSON.stringify(curr))
         page.redirect("/create-workout/" + id)
     }

@@ -46,7 +46,7 @@
     align-items: center;
     justify-content: left;
 }
-span{
+.sidebar span{
     margin-right: 4%;
 }
 .content{

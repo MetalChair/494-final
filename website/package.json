@@ -9,7 +9,8 @@
     "page": "^1.11.6",
     "socket.io": "^4.0.1",
     "svelte": "^3.37.0",
-    "uuid": "^8.3.2"
+    "uuid": "^8.3.2",
+    "serialport": "^9.0.7"
   },
   "devDependencies": {
     "@rollup/plugin-node-resolve": "^11.2.1",

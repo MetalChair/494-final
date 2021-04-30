@@ -2,12 +2,12 @@
     import {current_edit_workout, editor_target } from "./stores"
     import exercises from "../assets/exercises"
     import PropertyEditor from "./property-editor.svelte";
-    import { onDestroy, onMount } from "svelte";
+    import { beforeUpdate, onDestroy, onMount } from "svelte";
 import { readable, writable } from "svelte/store";
     export let ctx;
     export let id;
     let sub;
-    onMount(()=>{
+    beforeUpdate(()=>{
         id = ctx.id;
         let curr = JSON.parse(localStorage.getItem("routine_list"));
         let workout_obj = JSON.parse(curr[id])
@@ -18,6 +18,7 @@ import { readable, writable } from "svelte/store";
             localStorage.setItem("routine_list", JSON.stringify(curr))
         })
     })
+
     onDestroy(()=>{
         if(sub)
             sub();
@@ -187,9 +188,9 @@ import { readable, writable } from "svelte/store";
                                     class:teal ="{excs.beingEdited === true}"
                                     class:white-text ="{excs.beingEdited === true}"
                                 >   
-                                    {excs.name} x 
+                                    {excs.name}
                                     {#if excs.editable_props.reps != null}
-                                        {excs.editable_props.reps}
+                                        x {excs.editable_props.reps}
                                     {/if}
                                     {#if excs.editable_props.weight != null}
                                         ({excs.editable_props.weight} lbs.)

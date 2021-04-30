@@ -49,7 +49,9 @@ import { each } from "svelte/internal";
                 <a class = "workout-card z-depth-1" href = "/create-workout/{key}">
                     <div >
                         <b>{content.name}</b>
-                        <span>Performed {content.times_performed} time(s)</span>
+                        <span>
+                            Performed {content.times_performed} {content.times_performed === 1 ? "Time" : "Times"}
+                        </span>
                         <ul class = "collection">
                         {#each {length: Math.min(content.activities.length, 3)} as _, i}
                                 <li class = "collection-item">
@@ -58,7 +60,7 @@ import { each } from "svelte/internal";
                         {/each}
                         {#if content.activities.length > 3}
                                 <li class = "collection-item teal white-text">
-                                    ...And More!
+                                    ...And {content.activities.length - 3} More!
                                 </li>
                         {/if}
                         </ul>
