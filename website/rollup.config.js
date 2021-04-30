@@ -1,6 +1,6 @@
 import svelte from 'rollup-plugin-svelte';
 import resolve from '@rollup/plugin-node-resolve';
-
+import css from 'rollup-plugin-css-only'
 export default {
   // This `main.js` file we wrote
   input: 'src/main.js',
@@ -19,5 +19,6 @@ export default {
     }),
     // Tell any third-party plugins that we're building for the browser
     resolve({ browser: true }),
+    css({ output: 'bundle.css' })
   ],
 };

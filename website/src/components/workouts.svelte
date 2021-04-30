@@ -11,7 +11,7 @@ import { onMount } from "svelte";
 
     export let show_more = 1;
 </script>
-{#if workout_history === null}
+{#if $workout_history === null || $workout_history.length == 0}
     <div class = "readout-container">
         <h3>
             <b>No workouts found. Get to work! 💪</b>
@@ -25,7 +25,7 @@ import { onMount } from "svelte";
                 {#if !$workout_history.error}
 
                     {#each 
-                        {length: Math.min($workout_history.length, 10 * show_more)} as _,i
+                        {length: Math.min($workout_history.length , 10 * show_more)} as _,i
                     }
                     <div class="col s3 m6">
                         <div class="card teal lighten-4">
@@ -37,8 +37,9 @@ import { onMount } from "svelte";
                         </div>
                     </div>
                     {/each}
+                    <br>
                     <div class = "row center-align">
-                        {#if show_more * 10 }
+                        {#if show_more * 10 < $workout_history.length }
                             <button 
                                 class=" btn waves-effect waves-light" 
                                 on:click="{()=>{ show_more = show_more + 1}}"

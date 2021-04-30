@@ -1,6 +1,8 @@
 .content-container{
     display: flex;
     flex-direction: row;
+    max-height: 100%;
+    overflow: hidden;
 }
 .sidebar{
     min-height: 100%;
@@ -50,8 +52,8 @@ span{
 .content{
     min-height: 100vh;
     min-width: 80%;
-    overflow: hidden;
     z-index: 10;
+    overflow: hidden;
 }
 .content > * {
     width: 100%;
@@ -76,9 +78,14 @@ span{
 }
 .workouts-container{
     padding-left: 1em;
+    padding-right: 1em;
+
 }
 .workouts-card-container{
     display: flex;
     flex-direction: row;
     flex-wrap: wrap;
+}
+span{
+    white-space: pre;
 }

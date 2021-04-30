@@ -2,6 +2,7 @@ var app = (function () {
     'use strict';
 
     function noop() { }
+    const identity = x => x;
     function run(fn) {
         return fn();
     }
@@ -27,9 +28,47 @@ var app = (function () {
         const unsub = store.subscribe(...callbacks);
         return unsub.unsubscribe ? () => unsub.unsubscribe() : unsub;
     }
+    function component_subscribe(component, store, callback) {
+        component.$$.on_destroy.push(subscribe(store, callback));
+    }
     function set_store_value(store, ret, value = ret) {
         store.set(value);
         return ret;
+    }
+
+    const is_client = typeof window !== 'undefined';
+    let now = is_client
+        ? () => window.performance.now()
+        : () => Date.now();
+    let raf = is_client ? cb => requestAnimationFrame(cb) : noop;
+
+    const tasks = new Set();
+    function run_tasks(now) {
+        tasks.forEach(task => {
+            if (!task.c(now)) {
+                tasks.delete(task);
+                task.f();
+            }
+        });
+        if (tasks.size !== 0)
+            raf(run_tasks);
+    }
+    /**
+     * Creates a new task that runs on each raf frame
+     * until it returns a falsy value or is aborted
+     */
+    function loop(callback) {
+        let task;
+        if (tasks.size === 0)
+            raf(run_tasks);
+        return {
+            promise: new Promise(fulfill => {
+                tasks.add(task = { c: callback, f: fulfill });
+            }),
+            abort() {
+                tasks.delete(task);
+            }
+        };
     }
 
     function append(target, node) {
@@ -77,8 +116,77 @@ var app = (function () {
         if (text.wholeText !== data)
             text.data = data;
     }
+    function set_input_value(input, value) {
+        input.value = value == null ? '' : value;
+    }
     function toggle_class(element, name, toggle) {
         element.classList[toggle ? 'add' : 'remove'](name);
+    }
+    function custom_event(type, detail) {
+        const e = document.createEvent('CustomEvent');
+        e.initCustomEvent(type, false, false, detail);
+        return e;
+    }
+
+    const active_docs = new Set();
+    let active = 0;
+    // https://github.com/darkskyapp/string-hash/blob/master/index.js
+    function hash(str) {
+        let hash = 5381;
+        let i = str.length;
+        while (i--)
+            hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
+        return hash >>> 0;
+    }
+    function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+        const step = 16.666 / duration;
+        let keyframes = '{\n';
+        for (let p = 0; p <= 1; p += step) {
+            const t = a + (b - a) * ease(p);
+            keyframes += p * 100 + `%{${fn(t, 1 - t)}}\n`;
+        }
+        const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
+        const name = `__svelte_${hash(rule)}_${uid}`;
+        const doc = node.ownerDocument;
+        active_docs.add(doc);
+        const stylesheet = doc.__svelte_stylesheet || (doc.__svelte_stylesheet = doc.head.appendChild(element('style')).sheet);
+        const current_rules = doc.__svelte_rules || (doc.__svelte_rules = {});
+        if (!current_rules[name]) {
+            current_rules[name] = true;
+            stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+        }
+        const animation = node.style.animation || '';
+        node.style.animation = `${animation ? `${animation}, ` : ''}${name} ${duration}ms linear ${delay}ms 1 both`;
+        active += 1;
+        return name;
+    }
+    function delete_rule(node, name) {
+        const previous = (node.style.animation || '').split(', ');
+        const next = previous.filter(name
+            ? anim => anim.indexOf(name) < 0 // remove specific animation
+            : anim => anim.indexOf('__svelte') === -1 // remove all Svelte animations
+        );
+        const deleted = previous.length - next.length;
+        if (deleted) {
+            node.style.animation = next.join(', ');
+            active -= deleted;
+            if (!active)
+                clear_rules();
+        }
+    }
+    function clear_rules() {
+        raf(() => {
+            if (active)
+                return;
+            active_docs.forEach(doc => {
+                const stylesheet = doc.__svelte_stylesheet;
+                let i = stylesheet.cssRules.length;
+                while (i--)
+                    stylesheet.deleteRule(i);
+                doc.__svelte_rules = {};
+            });
+            active_docs.clear();
+        });
     }
 
     let current_component;
@@ -92,6 +200,9 @@ var app = (function () {
     }
     function onMount(fn) {
         get_current_component().$$.on_mount.push(fn);
+    }
+    function onDestroy(fn) {
+        get_current_component().$$.on_destroy.push(fn);
     }
 
     const dirty_components = [];
@@ -160,6 +271,20 @@ var app = (function () {
             $$.after_update.forEach(add_render_callback);
         }
     }
+
+    let promise;
+    function wait() {
+        if (!promise) {
+            promise = Promise.resolve();
+            promise.then(() => {
+                promise = null;
+            });
+        }
+        return promise;
+    }
+    function dispatch(node, direction, kind) {
+        node.dispatchEvent(custom_event(`${direction ? 'intro' : 'outro'}${kind}`));
+    }
     const outroing = new Set();
     let outros;
     function group_outros() {
@@ -196,6 +321,205 @@ var app = (function () {
             });
             block.o(local);
         }
+    }
+    const null_transition = { duration: 0 };
+    function create_in_transition(node, fn, params) {
+        let config = fn(node, params);
+        let running = false;
+        let animation_name;
+        let task;
+        let uid = 0;
+        function cleanup() {
+            if (animation_name)
+                delete_rule(node, animation_name);
+        }
+        function go() {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            if (css)
+                animation_name = create_rule(node, 0, 1, duration, delay, easing, css, uid++);
+            tick(0, 1);
+            const start_time = now() + delay;
+            const end_time = start_time + duration;
+            if (task)
+                task.abort();
+            running = true;
+            add_render_callback(() => dispatch(node, true, 'start'));
+            task = loop(now => {
+                if (running) {
+                    if (now >= end_time) {
+                        tick(1, 0);
+                        dispatch(node, true, 'end');
+                        cleanup();
+                        return running = false;
+                    }
+                    if (now >= start_time) {
+                        const t = easing((now - start_time) / duration);
+                        tick(t, 1 - t);
+                    }
+                }
+                return running;
+            });
+        }
+        let started = false;
+        return {
+            start() {
+                if (started)
+                    return;
+                delete_rule(node);
+                if (is_function(config)) {
+                    config = config();
+                    wait().then(go);
+                }
+                else {
+                    go();
+                }
+            },
+            invalidate() {
+                started = false;
+            },
+            end() {
+                if (running) {
+                    cleanup();
+                    running = false;
+                }
+            }
+        };
+    }
+    function create_out_transition(node, fn, params) {
+        let config = fn(node, params);
+        let running = true;
+        let animation_name;
+        const group = outros;
+        group.r += 1;
+        function go() {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            if (css)
+                animation_name = create_rule(node, 1, 0, duration, delay, easing, css);
+            const start_time = now() + delay;
+            const end_time = start_time + duration;
+            add_render_callback(() => dispatch(node, false, 'start'));
+            loop(now => {
+                if (running) {
+                    if (now >= end_time) {
+                        tick(0, 1);
+                        dispatch(node, false, 'end');
+                        if (!--group.r) {
+                            // this will result in `end()` being called,
+                            // so we don't need to clean up here
+                            run_all(group.c);
+                        }
+                        return false;
+                    }
+                    if (now >= start_time) {
+                        const t = easing((now - start_time) / duration);
+                        tick(1 - t, t);
+                    }
+                }
+                return running;
+            });
+        }
+        if (is_function(config)) {
+            wait().then(() => {
+                // @ts-ignore
+                config = config();
+                go();
+            });
+        }
+        else {
+            go();
+        }
+        return {
+            end(reset) {
+                if (reset && config.tick) {
+                    config.tick(1, 0);
+                }
+                if (running) {
+                    if (animation_name)
+                        delete_rule(node, animation_name);
+                    running = false;
+                }
+            }
+        };
+    }
+
+    function destroy_block(block, lookup) {
+        block.d(1);
+        lookup.delete(block.key);
+    }
+    function update_keyed_each(old_blocks, dirty, get_key, dynamic, ctx, list, lookup, node, destroy, create_each_block, next, get_context) {
+        let o = old_blocks.length;
+        let n = list.length;
+        let i = o;
+        const old_indexes = {};
+        while (i--)
+            old_indexes[old_blocks[i].key] = i;
+        const new_blocks = [];
+        const new_lookup = new Map();
+        const deltas = new Map();
+        i = n;
+        while (i--) {
+            const child_ctx = get_context(ctx, list, i);
+            const key = get_key(child_ctx);
+            let block = lookup.get(key);
+            if (!block) {
+                block = create_each_block(key, child_ctx);
+                block.c();
+            }
+            else if (dynamic) {
+                block.p(child_ctx, dirty);
+            }
+            new_lookup.set(key, new_blocks[i] = block);
+            if (key in old_indexes)
+                deltas.set(key, Math.abs(i - old_indexes[key]));
+        }
+        const will_move = new Set();
+        const did_move = new Set();
+        function insert(block) {
+            transition_in(block, 1);
+            block.m(node, next);
+            lookup.set(block.key, block);
+            next = block.first;
+            n--;
+        }
+        while (o && n) {
+            const new_block = new_blocks[n - 1];
+            const old_block = old_blocks[o - 1];
+            const new_key = new_block.key;
+            const old_key = old_block.key;
+            if (new_block === old_block) {
+                // do nothing
+                next = new_block.first;
+                o--;
+                n--;
+            }
+            else if (!new_lookup.has(old_key)) {
+                // remove old block
+                destroy(old_block, lookup);
+                o--;
+            }
+            else if (!lookup.has(new_key) || will_move.has(new_key)) {
+                insert(new_block);
+            }
+            else if (did_move.has(old_key)) {
+                o--;
+            }
+            else if (deltas.get(new_key) > deltas.get(old_key)) {
+                did_move.add(new_key);
+                insert(new_block);
+            }
+            else {
+                will_move.add(old_key);
+                o--;
+            }
+        }
+        while (o--) {
+            const old_block = old_blocks[o];
+            if (!new_lookup.has(old_block.key))
+                destroy(old_block, lookup);
+        }
+        while (n)
+            insert(new_blocks[n - 1]);
+        return new_blocks;
     }
 
     function bind(component, name, callback) {
@@ -384,9 +708,13 @@ var app = (function () {
         return { set, update, subscribe };
     }
 
+    const current_edit_workout = writable({});
+    const editor_target = writable(null);
+    const current_flex = writable(0);
+
     /* src\router-item.svelte generated by Svelte v3.37.0 */
 
-    function create_fragment$4(ctx) {
+    function create_fragment$a(ctx) {
     	let a;
     	let li;
     	let span;
@@ -436,7 +764,7 @@ var app = (function () {
     	};
     }
 
-    function instance$4($$self, $$props, $$invalidate) {
+    function instance$a($$self, $$props, $$invalidate) {
     	let { path } = $$props,
     		{ active } = $$props,
     		{ icon } = $$props,
@@ -455,13 +783,23 @@ var app = (function () {
     class Router_item extends SvelteComponent {
     	constructor(options) {
     		super();
-    		init(this, options, instance$4, create_fragment$4, safe_not_equal, { path: 0, active: 1, icon: 2, label: 3 });
+    		init(this, options, instance$a, create_fragment$a, safe_not_equal, { path: 0, active: 1, icon: 2, label: 3 });
     	}
+    }
+
+    function fade(node, { delay = 0, duration = 400, easing = identity } = {}) {
+        const o = +getComputedStyle(node).opacity;
+        return {
+            delay,
+            duration,
+            easing,
+            css: t => `opacity: ${t * o}`
+        };
     }
 
     /* src\components\live-readout.svelte generated by Svelte v3.37.0 */
 
-    function create_fragment$3(ctx) {
+    function create_fragment$9(ctx) {
     	let div;
     	let b0;
     	let t0;
@@ -499,7 +837,7 @@ var app = (function () {
     	};
     }
 
-    function instance$3($$self, $$props, $$invalidate) {
+    function instance$9($$self, $$props, $$invalidate) {
     	let { current_flex = 0 } = $$props;
 
     	$$self.$$set = $$props => {
@@ -512,13 +850,13 @@ var app = (function () {
     class Live_readout extends SvelteComponent {
     	constructor(options) {
     		super();
-    		init(this, options, instance$3, create_fragment$3, safe_not_equal, { current_flex: 0 });
+    		init(this, options, instance$9, create_fragment$9, safe_not_equal, { current_flex: 0 });
     	}
     }
 
     /* src\components\workouts.svelte generated by Svelte v3.37.0 */
 
-    function get_each_context$1(ctx, list, i) {
+    function get_each_context$4(ctx, list, i) {
     	const child_ctx = ctx.slice();
     	child_ctx[4] = list[i];
     	child_ctx[6] = i;
@@ -526,13 +864,13 @@ var app = (function () {
     }
 
     // (20:0) {:else}
-    function create_else_block(ctx) {
+    function create_else_block$1(ctx) {
     	let div2;
     	let h4;
     	let t1;
     	let div1;
     	let div0;
-    	let if_block = !/*$workout_history*/ ctx[2].error && create_if_block_1(ctx);
+    	let if_block = !/*$workout_history*/ ctx[2].error && create_if_block_1$2(ctx);
 
     	return {
     		c() {
@@ -560,7 +898,7 @@ var app = (function () {
     				if (if_block) {
     					if_block.p(ctx, dirty);
     				} else {
-    					if_block = create_if_block_1(ctx);
+    					if_block = create_if_block_1$2(ctx);
     					if_block.c();
     					if_block.m(div0, null);
     				}
@@ -576,8 +914,8 @@ var app = (function () {
     	};
     }
 
-    // (14:0) {#if workout_history === null}
-    function create_if_block$1(ctx) {
+    // (14:0) {#if $workout_history === null || $workout_history.length == 0}
+    function create_if_block$6(ctx) {
     	let div;
 
     	return {
@@ -597,8 +935,10 @@ var app = (function () {
     }
 
     // (25:16) {#if !$workout_history.error}
-    function create_if_block_1(ctx) {
-    	let t;
+    function create_if_block_1$2(ctx) {
+    	let t0;
+    	let br;
+    	let t1;
     	let div;
 
     	let each_value = {
@@ -608,10 +948,10 @@ var app = (function () {
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
+    		each_blocks[i] = create_each_block$4(get_each_context$4(ctx, each_value, i));
     	}
 
-    	let if_block = /*show_more*/ ctx[0] * 10 && create_if_block_2(ctx);
+    	let if_block = /*show_more*/ ctx[0] * 10 < /*$workout_history*/ ctx[2].length && create_if_block_2$1(ctx);
 
     	return {
     		c() {
@@ -619,7 +959,9 @@ var app = (function () {
     				each_blocks[i].c();
     			}
 
-    			t = space();
+    			t0 = space();
+    			br = element("br");
+    			t1 = space();
     			div = element("div");
     			if (if_block) if_block.c();
     			attr(div, "class", "row center-align");
@@ -629,7 +971,9 @@ var app = (function () {
     				each_blocks[i].m(target, anchor);
     			}
 
-    			insert(target, t, anchor);
+    			insert(target, t0, anchor);
+    			insert(target, br, anchor);
+    			insert(target, t1, anchor);
     			insert(target, div, anchor);
     			if (if_block) if_block.m(div, null);
     		},
@@ -642,14 +986,14 @@ var app = (function () {
     				let i;
 
     				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context$1(ctx, each_value, i);
+    					const child_ctx = get_each_context$4(ctx, each_value, i);
 
     					if (each_blocks[i]) {
     						each_blocks[i].p(child_ctx, dirty);
     					} else {
-    						each_blocks[i] = create_each_block$1(child_ctx);
+    						each_blocks[i] = create_each_block$4(child_ctx);
     						each_blocks[i].c();
-    						each_blocks[i].m(t.parentNode, t);
+    						each_blocks[i].m(t0.parentNode, t0);
     					}
     				}
 
@@ -660,11 +1004,11 @@ var app = (function () {
     				each_blocks.length = each_value.length;
     			}
 
-    			if (/*show_more*/ ctx[0] * 10) {
+    			if (/*show_more*/ ctx[0] * 10 < /*$workout_history*/ ctx[2].length) {
     				if (if_block) {
     					if_block.p(ctx, dirty);
     				} else {
-    					if_block = create_if_block_2(ctx);
+    					if_block = create_if_block_2$1(ctx);
     					if_block.c();
     					if_block.m(div, null);
     				}
@@ -675,15 +1019,17 @@ var app = (function () {
     		},
     		d(detaching) {
     			destroy_each(each_blocks, detaching);
-    			if (detaching) detach(t);
+    			if (detaching) detach(t0);
+    			if (detaching) detach(br);
+    			if (detaching) detach(t1);
     			if (detaching) detach(div);
     			if (if_block) if_block.d();
     		}
     	};
     }
 
-    // (27:20) {#each                           {length: Math.min($workout_history.length, 10 * show_more)} as _,i                      }
-    function create_each_block$1(ctx) {
+    // (27:20) {#each                           {length: Math.min($workout_history.length , 10 * show_more)} as _,i                      }
+    function create_each_block$4(ctx) {
     	let div2;
     	let div1;
     	let div0;
@@ -726,8 +1072,8 @@ var app = (function () {
     	};
     }
 
-    // (41:24) {#if show_more * 10 }
-    function create_if_block_2(ctx) {
+    // (42:24) {#if show_more * 10 < $workout_history.length }
+    function create_if_block_2$1(ctx) {
     	let button;
     	let mounted;
     	let dispose;
@@ -755,12 +1101,12 @@ var app = (function () {
     	};
     }
 
-    function create_fragment$2(ctx) {
+    function create_fragment$8(ctx) {
     	let if_block_anchor;
 
     	function select_block_type(ctx, dirty) {
-    		if (/*workout_history*/ ctx[1] === null) return create_if_block$1;
-    		return create_else_block;
+    		if (/*$workout_history*/ ctx[2] === null || /*$workout_history*/ ctx[2].length == 0) return create_if_block$6;
+    		return create_else_block$1;
     	}
 
     	let current_block_type = select_block_type(ctx);
@@ -776,7 +1122,17 @@ var app = (function () {
     			insert(target, if_block_anchor, anchor);
     		},
     		p(ctx, [dirty]) {
-    			if_block.p(ctx, dirty);
+    			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
+    				if_block.p(ctx, dirty);
+    			} else {
+    				if_block.d(1);
+    				if_block = current_block_type(ctx);
+
+    				if (if_block) {
+    					if_block.c();
+    					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    				}
+    			}
     		},
     		i: noop,
     		o: noop,
@@ -787,7 +1143,7 @@ var app = (function () {
     	};
     }
 
-    function instance$2($$self, $$props, $$invalidate) {
+    function instance$8($$self, $$props, $$invalidate) {
     	let $workout_history,
     		$$unsubscribe_workout_history = noop,
     		$$subscribe_workout_history = () => ($$unsubscribe_workout_history(), $$unsubscribe_workout_history = subscribe(workout_history, $$value => $$invalidate(2, $workout_history = $$value)), workout_history);
@@ -818,7 +1174,7 @@ var app = (function () {
     class Workouts extends SvelteComponent {
     	constructor(options) {
     		super();
-    		init(this, options, instance$2, create_fragment$2, safe_not_equal, { workout_history: 1, show_more: 0 });
+    		init(this, options, instance$8, create_fragment$8, safe_not_equal, { workout_history: 1, show_more: 0 });
     	}
 
     	get workout_history() {
@@ -826,25 +1182,1606 @@ var app = (function () {
     	}
     }
 
+    let exercises = new Map();
+    let data_arr = [
+        {
+            "name" : "Bicep Curls",
+            "desc" : "Add an interesting description",
+            "id" : 0,
+            "editable_props" : {
+                    "reps" : 10,
+                    "weight" : 25
+            }
+        },
+        {
+            "name" : "Shoulder Press",
+            "desc" : "Add an interesting description",
+            "id" : 1,
+            "editable_props" : {
+                "reps" : 10,
+                "weight" : 25
+
+            }
+        }
+    ];
+
+    data_arr.forEach(element =>{
+        exercises.set(element.id, element);
+    });
+
+    /* src\components\property-editor.svelte generated by Svelte v3.37.0 */
+
+    function get_each_context$3(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[3] = list[i][0];
+    	child_ctx[4] = list[i][1];
+    	child_ctx[5] = list;
+    	child_ctx[6] = i;
+    	return child_ctx;
+    }
+
+    // (10:4) {#if           $current_edit_workout.activities &&          $editor_target != null      }
+    function create_if_block$5(ctx) {
+    	let div2;
+    	let div0;
+    	let t1;
+    	let div1;
+    	let div2_intro;
+    	let div2_outro;
+    	let current;
+    	let each_value = Object.entries(/*$current_edit_workout*/ ctx[0].activities[/*$editor_target*/ ctx[1]].editable_props);
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value.length; i += 1) {
+    		each_blocks[i] = create_each_block$3(get_each_context$3(ctx, each_value, i));
+    	}
+
+    	return {
+    		c() {
+    			div2 = element("div");
+    			div0 = element("div");
+    			div0.innerHTML = `<span class="card-title">Edit Workout Properties</span>`;
+    			t1 = space();
+    			div1 = element("div");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			attr(div0, "class", "card-content white-text");
+    			attr(div1, "class", "card-action white-text");
+    			attr(div2, "class", "card teal svelte-sn8spe");
+    		},
+    		m(target, anchor) {
+    			insert(target, div2, anchor);
+    			append(div2, div0);
+    			append(div2, t1);
+    			append(div2, div1);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(div1, null);
+    			}
+
+    			current = true;
+    		},
+    		p(ctx, dirty) {
+    			if (dirty & /*$current_edit_workout, $editor_target, Object*/ 3) {
+    				each_value = Object.entries(/*$current_edit_workout*/ ctx[0].activities[/*$editor_target*/ ctx[1]].editable_props);
+    				let i;
+
+    				for (i = 0; i < each_value.length; i += 1) {
+    					const child_ctx = get_each_context$3(ctx, each_value, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(child_ctx, dirty);
+    					} else {
+    						each_blocks[i] = create_each_block$3(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(div1, null);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+
+    				each_blocks.length = each_value.length;
+    			}
+    		},
+    		i(local) {
+    			if (current) return;
+
+    			add_render_callback(() => {
+    				if (div2_outro) div2_outro.end(1);
+    				if (!div2_intro) div2_intro = create_in_transition(div2, fade, {});
+    				div2_intro.start();
+    			});
+
+    			current = true;
+    		},
+    		o(local) {
+    			if (div2_intro) div2_intro.invalidate();
+    			div2_outro = create_out_transition(div2, fade, {});
+    			current = false;
+    		},
+    		d(detaching) {
+    			if (detaching) detach(div2);
+    			destroy_each(each_blocks, detaching);
+    			if (detaching && div2_outro) div2_outro.end();
+    		}
+    	};
+    }
+
+    // (19:12) {#each Object.entries($current_edit_workout.activities[$editor_target].editable_props) as [key, value]}
+    function create_each_block$3(ctx) {
+    	let t0_value = /*key*/ ctx[3].toUpperCase() + "";
+    	let t0;
+    	let t1;
+    	let input;
+    	let mounted;
+    	let dispose;
+
+    	function input_input_handler() {
+    		/*input_input_handler*/ ctx[2].call(input, /*key*/ ctx[3]);
+    	}
+
+    	return {
+    		c() {
+    			t0 = text(t0_value);
+    			t1 = space();
+    			input = element("input");
+    			attr(input, "class", "white-text");
+    		},
+    		m(target, anchor) {
+    			insert(target, t0, anchor);
+    			insert(target, t1, anchor);
+    			insert(target, input, anchor);
+    			set_input_value(input, /*$current_edit_workout*/ ctx[0].activities[/*$editor_target*/ ctx[1]].editable_props[/*key*/ ctx[3]]);
+
+    			if (!mounted) {
+    				dispose = listen(input, "input", input_input_handler);
+    				mounted = true;
+    			}
+    		},
+    		p(new_ctx, dirty) {
+    			ctx = new_ctx;
+    			if (dirty & /*$current_edit_workout, $editor_target*/ 3 && t0_value !== (t0_value = /*key*/ ctx[3].toUpperCase() + "")) set_data(t0, t0_value);
+
+    			if (dirty & /*$current_edit_workout, $editor_target, Object*/ 3 && input.value !== /*$current_edit_workout*/ ctx[0].activities[/*$editor_target*/ ctx[1]].editable_props[/*key*/ ctx[3]]) {
+    				set_input_value(input, /*$current_edit_workout*/ ctx[0].activities[/*$editor_target*/ ctx[1]].editable_props[/*key*/ ctx[3]]);
+    			}
+    		},
+    		d(detaching) {
+    			if (detaching) detach(t0);
+    			if (detaching) detach(t1);
+    			if (detaching) detach(input);
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+    }
+
+    function create_fragment$7(ctx) {
+    	let if_block_anchor;
+    	let current;
+    	let if_block = /*$current_edit_workout*/ ctx[0].activities && /*$editor_target*/ ctx[1] != null && create_if_block$5(ctx);
+
+    	return {
+    		c() {
+    			if (if_block) if_block.c();
+    			if_block_anchor = empty();
+    		},
+    		m(target, anchor) {
+    			if (if_block) if_block.m(target, anchor);
+    			insert(target, if_block_anchor, anchor);
+    			current = true;
+    		},
+    		p(ctx, [dirty]) {
+    			if (/*$current_edit_workout*/ ctx[0].activities && /*$editor_target*/ ctx[1] != null) {
+    				if (if_block) {
+    					if_block.p(ctx, dirty);
+
+    					if (dirty & /*$current_edit_workout, $editor_target*/ 3) {
+    						transition_in(if_block, 1);
+    					}
+    				} else {
+    					if_block = create_if_block$5(ctx);
+    					if_block.c();
+    					transition_in(if_block, 1);
+    					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    				}
+    			} else if (if_block) {
+    				group_outros();
+
+    				transition_out(if_block, 1, 1, () => {
+    					if_block = null;
+    				});
+
+    				check_outros();
+    			}
+    		},
+    		i(local) {
+    			if (current) return;
+    			transition_in(if_block);
+    			current = true;
+    		},
+    		o(local) {
+    			transition_out(if_block);
+    			current = false;
+    		},
+    		d(detaching) {
+    			if (if_block) if_block.d(detaching);
+    			if (detaching) detach(if_block_anchor);
+    		}
+    	};
+    }
+
+    function instance$7($$self, $$props, $$invalidate) {
+    	let $current_edit_workout;
+    	let $editor_target;
+    	component_subscribe($$self, current_edit_workout, $$value => $$invalidate(0, $current_edit_workout = $$value));
+    	component_subscribe($$self, editor_target, $$value => $$invalidate(1, $editor_target = $$value));
+
+    	function input_input_handler(key) {
+    		$current_edit_workout.activities[$editor_target].editable_props[key] = this.value;
+    		current_edit_workout.set($current_edit_workout);
+    	}
+
+    	return [$current_edit_workout, $editor_target, input_input_handler];
+    }
+
+    class Property_editor extends SvelteComponent {
+    	constructor(options) {
+    		super();
+    		init(this, options, instance$7, create_fragment$7, safe_not_equal, {});
+    	}
+    }
+
+    /* src\components\create-workout.svelte generated by Svelte v3.37.0 */
+
+    function get_each_context$2(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[18] = list[i];
+    	child_ctx[20] = i;
+    	return child_ctx;
+    }
+
+    function get_each_context_1$1(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[21] = list[i][0];
+    	child_ctx[22] = list[i][1];
+    	return child_ctx;
+    }
+
+    // (145:20) {#each [...exercises] as [key, value]}
+    function create_each_block_1$1(ctx) {
+    	let li;
+    	let t0_value = /*value*/ ctx[22].name + "";
+    	let t0;
+    	let t1;
+    	let mounted;
+    	let dispose;
+
+    	function click_handler(...args) {
+    		return /*click_handler*/ ctx[9](/*value*/ ctx[22], ...args);
+    	}
+
+    	return {
+    		c() {
+    			li = element("li");
+    			t0 = text(t0_value);
+    			t1 = space();
+    			attr(li, "class", "collection-item exercise-listing svelte-19dcxvj");
+    		},
+    		m(target, anchor) {
+    			insert(target, li, anchor);
+    			append(li, t0);
+    			append(li, t1);
+
+    			if (!mounted) {
+    				dispose = listen(li, "click", click_handler);
+    				mounted = true;
+    			}
+    		},
+    		p(new_ctx, dirty) {
+    			ctx = new_ctx;
+    		},
+    		d(detaching) {
+    			if (detaching) detach(li);
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+    }
+
+    // (166:20) {:else}
+    function create_else_block(ctx) {
+    	let each_blocks = [];
+    	let each_1_lookup = new Map();
+    	let each_1_anchor;
+    	let each_value = /*$current_edit_workout*/ ctx[0]["activities"];
+    	const get_key = ctx => /*excs*/ ctx[18].key;
+
+    	for (let i = 0; i < each_value.length; i += 1) {
+    		let child_ctx = get_each_context$2(ctx, each_value, i);
+    		let key = get_key(child_ctx);
+    		each_1_lookup.set(key, each_blocks[i] = create_each_block$2(key, child_ctx));
+    	}
+
+    	return {
+    		c() {
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			each_1_anchor = empty();
+    		},
+    		m(target, anchor) {
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(target, anchor);
+    			}
+
+    			insert(target, each_1_anchor, anchor);
+    		},
+    		p(ctx, dirty) {
+    			if (dirty & /*$current_edit_workout, startDrag, endDrag, doDrag, onDrop, editItemAtIDX*/ 61) {
+    				each_value = /*$current_edit_workout*/ ctx[0]["activities"];
+    				each_blocks = update_keyed_each(each_blocks, dirty, get_key, 1, ctx, each_value, each_1_lookup, each_1_anchor.parentNode, destroy_block, create_each_block$2, each_1_anchor, get_each_context$2);
+    			}
+    		},
+    		d(detaching) {
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].d(detaching);
+    			}
+
+    			if (detaching) detach(each_1_anchor);
+    		}
+    	};
+    }
+
+    // (160:20) {#if !$current_edit_workout["activities"] ||                          $current_edit_workout["activities"].length === 0                      }
+    function create_if_block$4(ctx) {
+    	let div;
+
+    	return {
+    		c() {
+    			div = element("div");
+    			div.textContent = "Exercises you add will appear here!";
+    			attr(div, "class", "collection-item teal white-text");
+    		},
+    		m(target, anchor) {
+    			insert(target, div, anchor);
+    		},
+    		p: noop,
+    		d(detaching) {
+    			if (detaching) detach(div);
+    		}
+    	};
+    }
+
+    // (191:36) {#if excs.editable_props.reps != null}
+    function create_if_block_2(ctx) {
+    	let t_value = /*excs*/ ctx[18].editable_props.reps + "";
+    	let t;
+
+    	return {
+    		c() {
+    			t = text(t_value);
+    		},
+    		m(target, anchor) {
+    			insert(target, t, anchor);
+    		},
+    		p(ctx, dirty) {
+    			if (dirty & /*$current_edit_workout*/ 1 && t_value !== (t_value = /*excs*/ ctx[18].editable_props.reps + "")) set_data(t, t_value);
+    		},
+    		d(detaching) {
+    			if (detaching) detach(t);
+    		}
+    	};
+    }
+
+    // (194:36) {#if excs.editable_props.weight != null}
+    function create_if_block_1$1(ctx) {
+    	let t0;
+    	let t1_value = /*excs*/ ctx[18].editable_props.weight + "";
+    	let t1;
+    	let t2;
+
+    	return {
+    		c() {
+    			t0 = text("(");
+    			t1 = text(t1_value);
+    			t2 = text(" lbs.)");
+    		},
+    		m(target, anchor) {
+    			insert(target, t0, anchor);
+    			insert(target, t1, anchor);
+    			insert(target, t2, anchor);
+    		},
+    		p(ctx, dirty) {
+    			if (dirty & /*$current_edit_workout*/ 1 && t1_value !== (t1_value = /*excs*/ ctx[18].editable_props.weight + "")) set_data(t1, t1_value);
+    		},
+    		d(detaching) {
+    			if (detaching) detach(t0);
+    			if (detaching) detach(t1);
+    			if (detaching) detach(t2);
+    		}
+    	};
+    }
+
+    // (167:24) {#each $current_edit_workout["activities"]as excs, i (excs.key)}
+    function create_each_block$2(key_1, ctx) {
+    	let li;
+    	let t0_value = /*excs*/ ctx[18].name + "";
+    	let t0;
+    	let t1;
+    	let t2;
+    	let t3;
+    	let mounted;
+    	let dispose;
+    	let if_block0 = /*excs*/ ctx[18].editable_props.reps != null && create_if_block_2(ctx);
+    	let if_block1 = /*excs*/ ctx[18].editable_props.weight != null && create_if_block_1$1(ctx);
+
+    	function dragstart_handler(...args) {
+    		return /*dragstart_handler*/ ctx[10](/*excs*/ ctx[18], /*i*/ ctx[20], ...args);
+    	}
+
+    	function dragend_handler(...args) {
+    		return /*dragend_handler*/ ctx[11](/*excs*/ ctx[18], /*i*/ ctx[20], ...args);
+    	}
+
+    	function dragover_handler(...args) {
+    		return /*dragover_handler*/ ctx[12](/*excs*/ ctx[18], /*i*/ ctx[20], ...args);
+    	}
+
+    	function drop_handler(...args) {
+    		return /*drop_handler*/ ctx[13](/*excs*/ ctx[18], /*i*/ ctx[20], ...args);
+    	}
+
+    	function click_handler_1(...args) {
+    		return /*click_handler_1*/ ctx[14](/*i*/ ctx[20], ...args);
+    	}
+
+    	return {
+    		key: key_1,
+    		first: null,
+    		c() {
+    			li = element("li");
+    			t0 = text(t0_value);
+    			t1 = text(" x \r\n                                    ");
+    			if (if_block0) if_block0.c();
+    			t2 = space();
+    			if (if_block1) if_block1.c();
+    			t3 = space();
+    			attr(li, "class", "collection-item exercise-listing svelte-19dcxvj");
+    			attr(li, "draggable", "true");
+    			toggle_class(li, "being-dragged", /*excs*/ ctx[18].beingDragged === true);
+    			toggle_class(li, "teal", /*excs*/ ctx[18].beingEdited === true);
+    			toggle_class(li, "white-text", /*excs*/ ctx[18].beingEdited === true);
+    			this.first = li;
+    		},
+    		m(target, anchor) {
+    			insert(target, li, anchor);
+    			append(li, t0);
+    			append(li, t1);
+    			if (if_block0) if_block0.m(li, null);
+    			append(li, t2);
+    			if (if_block1) if_block1.m(li, null);
+    			append(li, t3);
+
+    			if (!mounted) {
+    				dispose = [
+    					listen(li, "dragstart", dragstart_handler),
+    					listen(li, "dragend", dragend_handler),
+    					listen(li, "dragover", dragover_handler),
+    					listen(li, "drop", drop_handler),
+    					listen(li, "click", click_handler_1)
+    				];
+
+    				mounted = true;
+    			}
+    		},
+    		p(new_ctx, dirty) {
+    			ctx = new_ctx;
+    			if (dirty & /*$current_edit_workout*/ 1 && t0_value !== (t0_value = /*excs*/ ctx[18].name + "")) set_data(t0, t0_value);
+
+    			if (/*excs*/ ctx[18].editable_props.reps != null) {
+    				if (if_block0) {
+    					if_block0.p(ctx, dirty);
+    				} else {
+    					if_block0 = create_if_block_2(ctx);
+    					if_block0.c();
+    					if_block0.m(li, t2);
+    				}
+    			} else if (if_block0) {
+    				if_block0.d(1);
+    				if_block0 = null;
+    			}
+
+    			if (/*excs*/ ctx[18].editable_props.weight != null) {
+    				if (if_block1) {
+    					if_block1.p(ctx, dirty);
+    				} else {
+    					if_block1 = create_if_block_1$1(ctx);
+    					if_block1.c();
+    					if_block1.m(li, t3);
+    				}
+    			} else if (if_block1) {
+    				if_block1.d(1);
+    				if_block1 = null;
+    			}
+
+    			if (dirty & /*$current_edit_workout*/ 1) {
+    				toggle_class(li, "being-dragged", /*excs*/ ctx[18].beingDragged === true);
+    			}
+
+    			if (dirty & /*$current_edit_workout*/ 1) {
+    				toggle_class(li, "teal", /*excs*/ ctx[18].beingEdited === true);
+    			}
+
+    			if (dirty & /*$current_edit_workout*/ 1) {
+    				toggle_class(li, "white-text", /*excs*/ ctx[18].beingEdited === true);
+    			}
+    		},
+    		d(detaching) {
+    			if (detaching) detach(li);
+    			if (if_block0) if_block0.d();
+    			if (if_block1) if_block1.d();
+    			mounted = false;
+    			run_all(dispose);
+    		}
+    	};
+    }
+
+    function create_fragment$6(ctx) {
+    	let div8;
+    	let h4;
+    	let t1;
+    	let div7;
+    	let div1;
+    	let h6;
+    	let t3;
+    	let div0;
+    	let input;
+    	let t4;
+    	let div6;
+    	let div3;
+    	let div2;
+    	let t6;
+    	let ul0;
+    	let t7;
+    	let div5;
+    	let div4;
+    	let t9;
+    	let ul1;
+    	let t10;
+    	let propertyeditor;
+    	let current;
+    	let mounted;
+    	let dispose;
+    	let each_value_1 = [...exercises];
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value_1.length; i += 1) {
+    		each_blocks[i] = create_each_block_1$1(get_each_context_1$1(ctx, each_value_1, i));
+    	}
+
+    	function select_block_type(ctx, dirty) {
+    		if (!/*$current_edit_workout*/ ctx[0]["activities"] || /*$current_edit_workout*/ ctx[0]["activities"].length === 0) return create_if_block$4;
+    		return create_else_block;
+    	}
+
+    	let current_block_type = select_block_type(ctx);
+    	let if_block = current_block_type(ctx);
+    	propertyeditor = new Property_editor({});
+
+    	return {
+    		c() {
+    			div8 = element("div");
+    			h4 = element("h4");
+    			h4.innerHTML = `<b>Edit A Routine:</b>`;
+    			t1 = space();
+    			div7 = element("div");
+    			div1 = element("div");
+    			h6 = element("h6");
+    			h6.innerHTML = `<b>Name:</b>`;
+    			t3 = space();
+    			div0 = element("div");
+    			input = element("input");
+    			t4 = space();
+    			div6 = element("div");
+    			div3 = element("div");
+    			div2 = element("div");
+    			div2.innerHTML = `<b>Available Exercises:</b>`;
+    			t6 = space();
+    			ul0 = element("ul");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			t7 = space();
+    			div5 = element("div");
+    			div4 = element("div");
+    			div4.innerHTML = `<b>Your Workout:</b>`;
+    			t9 = space();
+    			ul1 = element("ul");
+    			if_block.c();
+    			t10 = space();
+    			create_component(propertyeditor.$$.fragment);
+    			attr(input, "id", "name");
+    			attr(input, "type", "text");
+    			attr(input, "class", "input-field inline svelte-19dcxvj");
+    			attr(div0, "class", "title-save-container svelte-19dcxvj");
+    			attr(div1, "class", "input-field col s6");
+    			attr(div2, "class", "col-header svelte-19dcxvj");
+    			attr(ul0, "class", "collection");
+    			attr(div3, "class", "workout-creator-col svelte-19dcxvj");
+    			attr(div4, "class", "col-header svelte-19dcxvj");
+    			attr(ul1, "class", "collection drag-container svelte-19dcxvj");
+    			attr(div5, "class", "workout-creator-col svelte-19dcxvj");
+    			attr(div6, "class", "workout-creator-cols svelte-19dcxvj");
+    			attr(div7, "class", "create-workout-container svelte-19dcxvj");
+    			attr(div8, "class", "workouts-container");
+    		},
+    		m(target, anchor) {
+    			insert(target, div8, anchor);
+    			append(div8, h4);
+    			append(div8, t1);
+    			append(div8, div7);
+    			append(div7, div1);
+    			append(div1, h6);
+    			append(div1, t3);
+    			append(div1, div0);
+    			append(div0, input);
+    			set_input_value(input, /*$current_edit_workout*/ ctx[0].name);
+    			append(div7, t4);
+    			append(div7, div6);
+    			append(div6, div3);
+    			append(div3, div2);
+    			append(div3, t6);
+    			append(div3, ul0);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(ul0, null);
+    			}
+
+    			append(div6, t7);
+    			append(div6, div5);
+    			append(div5, div4);
+    			append(div5, t9);
+    			append(div5, ul1);
+    			if_block.m(ul1, null);
+    			append(div8, t10);
+    			mount_component(propertyeditor, div8, null);
+    			current = true;
+
+    			if (!mounted) {
+    				dispose = listen(input, "input", /*input_input_handler*/ ctx[8]);
+    				mounted = true;
+    			}
+    		},
+    		p(ctx, [dirty]) {
+    			if (dirty & /*$current_edit_workout*/ 1 && input.value !== /*$current_edit_workout*/ ctx[0].name) {
+    				set_input_value(input, /*$current_edit_workout*/ ctx[0].name);
+    			}
+
+    			if (dirty & /*addExercise, exercises*/ 2) {
+    				each_value_1 = [...exercises];
+    				let i;
+
+    				for (i = 0; i < each_value_1.length; i += 1) {
+    					const child_ctx = get_each_context_1$1(ctx, each_value_1, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(child_ctx, dirty);
+    					} else {
+    						each_blocks[i] = create_each_block_1$1(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(ul0, null);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+
+    				each_blocks.length = each_value_1.length;
+    			}
+
+    			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
+    				if_block.p(ctx, dirty);
+    			} else {
+    				if_block.d(1);
+    				if_block = current_block_type(ctx);
+
+    				if (if_block) {
+    					if_block.c();
+    					if_block.m(ul1, null);
+    				}
+    			}
+    		},
+    		i(local) {
+    			if (current) return;
+    			transition_in(propertyeditor.$$.fragment, local);
+    			current = true;
+    		},
+    		o(local) {
+    			transition_out(propertyeditor.$$.fragment, local);
+    			current = false;
+    		},
+    		d(detaching) {
+    			if (detaching) detach(div8);
+    			destroy_each(each_blocks, detaching);
+    			if_block.d();
+    			destroy_component(propertyeditor);
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+    }
+
+    function doDrag(e, entry, idx) {
+    	e.preventDefault();
+    	e.pageX; var dragY = e.pageY;
+    	e.target.style.top = dragY + "px";
+    }
+
+    function instance$6($$self, $$props, $$invalidate) {
+    	let $current_edit_workout;
+    	let $editor_target;
+    	component_subscribe($$self, current_edit_workout, $$value => $$invalidate(0, $current_edit_workout = $$value));
+    	component_subscribe($$self, editor_target, $$value => $$invalidate(16, $editor_target = $$value));
+    	let { ctx } = $$props;
+    	let { id } = $$props;
+    	let sub;
+
+    	onMount(() => {
+    		$$invalidate(6, id = ctx.id);
+    		let curr = JSON.parse(localStorage.getItem("routine_list"));
+    		let workout_obj = JSON.parse(curr[id]);
+    		current_edit_workout.set(workout_obj);
+
+    		sub = current_edit_workout.subscribe(value => {
+    			let curr = JSON.parse(localStorage.getItem("routine_list"));
+    			curr[id] = JSON.stringify($current_edit_workout);
+    			localStorage.setItem("routine_list", JSON.stringify(curr));
+    		});
+    	});
+
+    	onDestroy(() => {
+    		if (sub) sub();
+    		set_store_value(editor_target, $editor_target = null, $editor_target);
+
+    		if ($current_edit_workout.activities.length === 0 && $current_edit_workout.name === "My Cool Workout") {
+    			let curr = JSON.parse(localStorage.getItem("routine_list"));
+    			delete curr[id];
+    			localStorage.setItem("routine_list", JSON.stringify(curr));
+    		}
+    	});
+
+    	function addExercise(e, ex) {
+    		current_edit_workout.update(curr => {
+    			ex.key = Math.random();
+    			let ret;
+    			ret = curr;
+    			ret["activities"].push(_.cloneDeep(ex));
+    			return ret;
+    		});
+    	}
+
+    	function startDrag(e, entry, idx) {
+    		clearEditor();
+    		set_store_value(current_edit_workout, $current_edit_workout.activities[idx].beingDragged = true, $current_edit_workout);
+
+    		//Set the origin index for the transfer
+    		e.dataTransfer.setData("source", idx);
+    	}
+
+    	function endDrag(e, entry, idx) {
+    		e.preventDefault();
+    		set_store_value(current_edit_workout, $current_edit_workout.activities[idx].beingDragged = null, $current_edit_workout);
+    	}
+
+    	function onDrop(e, entry, idx) {
+    		let src = e.dataTransfer.getData("source");
+    		let temp = $current_edit_workout.activities[idx];
+    		set_store_value(current_edit_workout, $current_edit_workout.activities[idx] = $current_edit_workout.activities[src], $current_edit_workout);
+    		set_store_value(current_edit_workout, $current_edit_workout.activities[src] = temp, $current_edit_workout);
+    	}
+
+    	function editItemAtIDX(idx) {
+    		clearEditor();
+    		set_store_value(current_edit_workout, $current_edit_workout.activities[idx].beingEdited = true, $current_edit_workout);
+    		editor_target.set(idx);
+    	}
+
+    	function clearEditor() {
+    		if ($editor_target != null) set_store_value(current_edit_workout, $current_edit_workout.activities[$editor_target].beingEdited = false, $current_edit_workout);
+    	}
+
+    	function input_input_handler() {
+    		$current_edit_workout.name = this.value;
+    		current_edit_workout.set($current_edit_workout);
+    	}
+
+    	const click_handler = (value, e) => addExercise(e, value);
+    	const dragstart_handler = (excs, i, e) => startDrag(e, excs, i);
+    	const dragend_handler = (excs, i, e) => endDrag(e, excs, i);
+    	const dragover_handler = (excs, i, e) => doDrag(e);
+    	const drop_handler = (excs, i, e) => onDrop(e, excs, i);
+    	const click_handler_1 = (i, e) => editItemAtIDX(i);
+
+    	$$self.$$set = $$props => {
+    		if ("ctx" in $$props) $$invalidate(7, ctx = $$props.ctx);
+    		if ("id" in $$props) $$invalidate(6, id = $$props.id);
+    	};
+
+    	return [
+    		$current_edit_workout,
+    		addExercise,
+    		startDrag,
+    		endDrag,
+    		onDrop,
+    		editItemAtIDX,
+    		id,
+    		ctx,
+    		input_input_handler,
+    		click_handler,
+    		dragstart_handler,
+    		dragend_handler,
+    		dragover_handler,
+    		drop_handler,
+    		click_handler_1
+    	];
+    }
+
+    class Create_workout extends SvelteComponent {
+    	constructor(options) {
+    		super();
+    		init(this, options, instance$6, create_fragment$6, safe_not_equal, { ctx: 7, id: 6 });
+    	}
+    }
+
+    /* src\components\view-workouts.svelte generated by Svelte v3.37.0 */
+
+    function get_each_context$1(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[2] = list[i][0];
+    	child_ctx[3] = list[i][1];
+    	return child_ctx;
+    }
+
+    function get_each_context_1(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[6] = list[i];
+    	child_ctx[8] = i;
+    	return child_ctx;
+    }
+
+    // (46:4) {#if workouts != null}
+    function create_if_block$3(ctx) {
+    	let div;
+    	let each_value = Object.entries(/*workouts*/ ctx[0]).map(/*func*/ ctx[1]);
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value.length; i += 1) {
+    		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
+    	}
+
+    	return {
+    		c() {
+    			div = element("div");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			attr(div, "class", "workout-viewer row svelte-1mczv8v");
+    		},
+    		m(target, anchor) {
+    			insert(target, div, anchor);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(div, null);
+    			}
+    		},
+    		p(ctx, dirty) {
+    			if (dirty & /*Object, workouts, JSON, Math*/ 1) {
+    				each_value = Object.entries(/*workouts*/ ctx[0]).map(/*func*/ ctx[1]);
+    				let i;
+
+    				for (i = 0; i < each_value.length; i += 1) {
+    					const child_ctx = get_each_context$1(ctx, each_value, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(child_ctx, dirty);
+    					} else {
+    						each_blocks[i] = create_each_block$1(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(div, null);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+
+    				each_blocks.length = each_value.length;
+    			}
+    		},
+    		d(detaching) {
+    			if (detaching) detach(div);
+    			destroy_each(each_blocks, detaching);
+    		}
+    	};
+    }
+
+    // (54:24) {#each {length: Math.min(content.activities.length, 3)} as _, i}
+    function create_each_block_1(ctx) {
+    	let li;
+    	let t_value = /*content*/ ctx[3].activities[/*i*/ ctx[8]].name + "";
+    	let t;
+
+    	return {
+    		c() {
+    			li = element("li");
+    			t = text(t_value);
+    			attr(li, "class", "collection-item");
+    		},
+    		m(target, anchor) {
+    			insert(target, li, anchor);
+    			append(li, t);
+    		},
+    		p(ctx, dirty) {
+    			if (dirty & /*workouts*/ 1 && t_value !== (t_value = /*content*/ ctx[3].activities[/*i*/ ctx[8]].name + "")) set_data(t, t_value);
+    		},
+    		d(detaching) {
+    			if (detaching) detach(li);
+    		}
+    	};
+    }
+
+    // (59:24) {#if content.activities.length > 3}
+    function create_if_block_1(ctx) {
+    	let li;
+
+    	return {
+    		c() {
+    			li = element("li");
+    			li.textContent = "...And More!";
+    			attr(li, "class", "collection-item teal white-text");
+    		},
+    		m(target, anchor) {
+    			insert(target, li, anchor);
+    		},
+    		d(detaching) {
+    			if (detaching) detach(li);
+    		}
+    	};
+    }
+
+    // (48:8) {#each Object.entries(workouts).map(x=> [x[0],JSON.parse(x[1])]) as [key,content]}
+    function create_each_block$1(ctx) {
+    	let a1;
+    	let div;
+    	let b;
+    	let t0_value = /*content*/ ctx[3].name + "";
+    	let t0;
+    	let t1;
+    	let span;
+    	let t2;
+    	let t3_value = /*content*/ ctx[3].times_performed + "";
+    	let t3;
+    	let t4;
+    	let t5;
+    	let ul;
+    	let t6;
+    	let t7;
+    	let a0;
+    	let t8;
+    	let a0_href_value;
+    	let t9;
+    	let a1_href_value;
+
+    	let each_value_1 = {
+    		length: Math.min(/*content*/ ctx[3].activities.length, 3)
+    	};
+
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value_1.length; i += 1) {
+    		each_blocks[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
+    	}
+
+    	let if_block = /*content*/ ctx[3].activities.length > 3 && create_if_block_1();
+
+    	return {
+    		c() {
+    			a1 = element("a");
+    			div = element("div");
+    			b = element("b");
+    			t0 = text(t0_value);
+    			t1 = space();
+    			span = element("span");
+    			t2 = text("Performed ");
+    			t3 = text(t3_value);
+    			t4 = text(" time(s)");
+    			t5 = space();
+    			ul = element("ul");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			t6 = space();
+    			if (if_block) if_block.c();
+    			t7 = space();
+    			a0 = element("a");
+    			t8 = text("Start");
+    			t9 = space();
+    			attr(ul, "class", "collection");
+    			attr(a0, "href", a0_href_value = "./run-workout/" + /*key*/ ctx[2]);
+    			attr(a0, "class", "button");
+    			attr(div, "class", "svelte-1mczv8v");
+    			attr(a1, "class", "workout-card z-depth-1 svelte-1mczv8v");
+    			attr(a1, "href", a1_href_value = "/create-workout/" + /*key*/ ctx[2]);
+    		},
+    		m(target, anchor) {
+    			insert(target, a1, anchor);
+    			append(a1, div);
+    			append(div, b);
+    			append(b, t0);
+    			append(div, t1);
+    			append(div, span);
+    			append(span, t2);
+    			append(span, t3);
+    			append(span, t4);
+    			append(div, t5);
+    			append(div, ul);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(ul, null);
+    			}
+
+    			append(ul, t6);
+    			if (if_block) if_block.m(ul, null);
+    			append(div, t7);
+    			append(div, a0);
+    			append(a0, t8);
+    			append(a1, t9);
+    		},
+    		p(ctx, dirty) {
+    			if (dirty & /*workouts*/ 1 && t0_value !== (t0_value = /*content*/ ctx[3].name + "")) set_data(t0, t0_value);
+    			if (dirty & /*workouts*/ 1 && t3_value !== (t3_value = /*content*/ ctx[3].times_performed + "")) set_data(t3, t3_value);
+
+    			if (dirty & /*Object, workouts, JSON*/ 1) {
+    				each_value_1 = {
+    					length: Math.min(/*content*/ ctx[3].activities.length, 3)
+    				};
+
+    				let i;
+
+    				for (i = 0; i < each_value_1.length; i += 1) {
+    					const child_ctx = get_each_context_1(ctx, each_value_1, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(child_ctx, dirty);
+    					} else {
+    						each_blocks[i] = create_each_block_1(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(ul, t6);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+
+    				each_blocks.length = each_value_1.length;
+    			}
+
+    			if (/*content*/ ctx[3].activities.length > 3) {
+    				if (if_block) ; else {
+    					if_block = create_if_block_1();
+    					if_block.c();
+    					if_block.m(ul, null);
+    				}
+    			} else if (if_block) {
+    				if_block.d(1);
+    				if_block = null;
+    			}
+
+    			if (dirty & /*workouts*/ 1 && a0_href_value !== (a0_href_value = "./run-workout/" + /*key*/ ctx[2])) {
+    				attr(a0, "href", a0_href_value);
+    			}
+
+    			if (dirty & /*workouts*/ 1 && a1_href_value !== (a1_href_value = "/create-workout/" + /*key*/ ctx[2])) {
+    				attr(a1, "href", a1_href_value);
+    			}
+    		},
+    		d(detaching) {
+    			if (detaching) detach(a1);
+    			destroy_each(each_blocks, detaching);
+    			if (if_block) if_block.d();
+    		}
+    	};
+    }
+
+    function create_fragment$5(ctx) {
+    	let div;
+    	let h4;
+    	let br;
+    	let t1;
+    	let if_block = /*workouts*/ ctx[0] != null && create_if_block$3(ctx);
+
+    	return {
+    		c() {
+    			div = element("div");
+    			h4 = element("h4");
+    			h4.innerHTML = `<b>Your Routines</b>`;
+    			br = element("br");
+    			t1 = space();
+    			if (if_block) if_block.c();
+    			attr(div, "class", "workouts-container");
+    		},
+    		m(target, anchor) {
+    			insert(target, div, anchor);
+    			append(div, h4);
+    			append(div, br);
+    			append(div, t1);
+    			if (if_block) if_block.m(div, null);
+    		},
+    		p(ctx, [dirty]) {
+    			if (/*workouts*/ ctx[0] != null) {
+    				if (if_block) {
+    					if_block.p(ctx, dirty);
+    				} else {
+    					if_block = create_if_block$3(ctx);
+    					if_block.c();
+    					if_block.m(div, null);
+    				}
+    			} else if (if_block) {
+    				if_block.d(1);
+    				if_block = null;
+    			}
+    		},
+    		i: noop,
+    		o: noop,
+    		d(detaching) {
+    			if (detaching) detach(div);
+    			if (if_block) if_block.d();
+    		}
+    	};
+    }
+
+    function instance$5($$self, $$props, $$invalidate) {
+    	let workouts;
+
+    	try {
+    		workouts = JSON.parse(localStorage.getItem("routine_list"));
+    	} catch(e) {
+    		console.log(e);
+    		workouts = null;
+    	}
+
+    	const func = x => [x[0], JSON.parse(x[1])];
+    	return [workouts, func];
+    }
+
+    class View_workouts extends SvelteComponent {
+    	constructor(options) {
+    		super();
+    		init(this, options, instance$5, create_fragment$5, safe_not_equal, {});
+    	}
+    }
+
+    // Unique ID creation requires a high quality random # generator. In the browser we therefore
+    // require the crypto API and do not support built-in fallback to lower quality random number
+    // generators (like Math.random()).
+    var getRandomValues;
+    var rnds8 = new Uint8Array(16);
+    function rng() {
+      // lazy load so that environments that need to polyfill have a chance to do so
+      if (!getRandomValues) {
+        // getRandomValues needs to be invoked in a context where "this" is a Crypto implementation. Also,
+        // find the complete implementation of crypto (msCrypto) on IE11.
+        getRandomValues = typeof crypto !== 'undefined' && crypto.getRandomValues && crypto.getRandomValues.bind(crypto) || typeof msCrypto !== 'undefined' && typeof msCrypto.getRandomValues === 'function' && msCrypto.getRandomValues.bind(msCrypto);
+
+        if (!getRandomValues) {
+          throw new Error('crypto.getRandomValues() not supported. See https://github.com/uuidjs/uuid#getrandomvalues-not-supported');
+        }
+      }
+
+      return getRandomValues(rnds8);
+    }
+
+    var REGEX = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
+
+    function validate(uuid) {
+      return typeof uuid === 'string' && REGEX.test(uuid);
+    }
+
+    /**
+     * Convert array of 16 byte values to UUID string format of the form:
+     * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+     */
+
+    var byteToHex = [];
+
+    for (var i = 0; i < 256; ++i) {
+      byteToHex.push((i + 0x100).toString(16).substr(1));
+    }
+
+    function stringify(arr) {
+      var offset = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+      // Note: Be careful editing this code!  It's been tuned for performance
+      // and works in ways you may not expect. See https://github.com/uuidjs/uuid/pull/434
+      var uuid = (byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + '-' + byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + '-' + byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + '-' + byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + '-' + byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase(); // Consistency check for valid UUID.  If this throws, it's likely due to one
+      // of the following:
+      // - One or more input array values don't map to a hex octet (leading to
+      // "undefined" in the uuid)
+      // - Invalid input values for the RFC `version` or `variant` fields
+
+      if (!validate(uuid)) {
+        throw TypeError('Stringified UUID is invalid');
+      }
+
+      return uuid;
+    }
+
+    function v4(options, buf, offset) {
+      options = options || {};
+      var rnds = options.random || (options.rng || rng)(); // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+
+      rnds[6] = rnds[6] & 0x0f | 0x40;
+      rnds[8] = rnds[8] & 0x3f | 0x80; // Copy bytes to buffer, if provided
+
+      if (buf) {
+        offset = offset || 0;
+
+        for (var i = 0; i < 16; ++i) {
+          buf[offset + i] = rnds[i];
+        }
+
+        return buf;
+      }
+
+      return stringify(rnds);
+    }
+
+    /* src\components\runner\calibrate.svelte generated by Svelte v3.37.0 */
+
+    function create_fragment$4(ctx) {
+    	let t;
+
+    	return {
+    		c() {
+    			t = text("Calibrating");
+    		},
+    		m(target, anchor) {
+    			insert(target, t, anchor);
+    		},
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d(detaching) {
+    			if (detaching) detach(t);
+    		}
+    	};
+    }
+
+    function instance$4($$self, $$props, $$invalidate) {
+    	let { done } = $$props;
+    	done();
+
+    	$$self.$$set = $$props => {
+    		if ("done" in $$props) $$invalidate(0, done = $$props.done);
+    	};
+
+    	return [done];
+    }
+
+    class Calibrate extends SvelteComponent {
+    	constructor(options) {
+    		super();
+    		init(this, options, instance$4, create_fragment$4, safe_not_equal, { done: 0 });
+    	}
+    }
+
+    //States that the workout runner can currently be in
+    const states = {
+        CALIBRATING: 0, //Calibrating the sensor
+        0: "CALIBRATING", 
+        RUNNING: 1, //Activity is currently running
+        1: "RUNNING",
+        PAUSED: 2, //Workout paused
+        2: "PAUSED",
+        SWITCHING: 3, //Move the flex sensor from x to y
+        3: "SWITCHING",
+        INIT: 4, //Put the flex sensor on your arm/wrist/leg/body
+        4: "INIT"
+    };
+
+    /* src\components\runner\instructor.svelte generated by Svelte v3.37.0 */
+
+    function create_if_block$2(ctx) {
+    	let t0;
+    	let br;
+    	let t1;
+
+    	return {
+    		c() {
+    			t0 = text("GRAPHIC here");
+    			br = element("br");
+    			t1 = text("\r\n    PUT THE SENSOR ON");
+    		},
+    		m(target, anchor) {
+    			insert(target, t0, anchor);
+    			insert(target, br, anchor);
+    			insert(target, t1, anchor);
+    		},
+    		d(detaching) {
+    			if (detaching) detach(t0);
+    			if (detaching) detach(br);
+    			if (detaching) detach(t1);
+    		}
+    	};
+    }
+
+    function create_fragment$3(ctx) {
+    	let t0;
+    	let br;
+    	let t1;
+    	let button;
+    	let mounted;
+    	let dispose;
+    	let if_block = /*state*/ ctx[1] === states.INIT && create_if_block$2();
+
+    	return {
+    		c() {
+    			if (if_block) if_block.c();
+    			t0 = space();
+    			br = element("br");
+    			t1 = space();
+    			button = element("button");
+    			button.textContent = "Done";
+    		},
+    		m(target, anchor) {
+    			if (if_block) if_block.m(target, anchor);
+    			insert(target, t0, anchor);
+    			insert(target, br, anchor);
+    			insert(target, t1, anchor);
+    			insert(target, button, anchor);
+
+    			if (!mounted) {
+    				dispose = listen(button, "click", function () {
+    					if (is_function(/*done*/ ctx[0]())) /*done*/ ctx[0]().apply(this, arguments);
+    				});
+
+    				mounted = true;
+    			}
+    		},
+    		p(new_ctx, [dirty]) {
+    			ctx = new_ctx;
+
+    			if (/*state*/ ctx[1] === states.INIT) {
+    				if (if_block) ; else {
+    					if_block = create_if_block$2();
+    					if_block.c();
+    					if_block.m(t0.parentNode, t0);
+    				}
+    			} else if (if_block) {
+    				if_block.d(1);
+    				if_block = null;
+    			}
+    		},
+    		i: noop,
+    		o: noop,
+    		d(detaching) {
+    			if (if_block) if_block.d(detaching);
+    			if (detaching) detach(t0);
+    			if (detaching) detach(br);
+    			if (detaching) detach(t1);
+    			if (detaching) detach(button);
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+    }
+
+    function instance$3($$self, $$props, $$invalidate) {
+    	let { done } = $$props, { state } = $$props;
+
+    	$$self.$$set = $$props => {
+    		if ("done" in $$props) $$invalidate(0, done = $$props.done);
+    		if ("state" in $$props) $$invalidate(1, state = $$props.state);
+    	};
+
+    	return [done, state];
+    }
+
+    class Instructor extends SvelteComponent {
+    	constructor(options) {
+    		super();
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, { done: 0, state: 1 });
+    	}
+    }
+
+    /* src\components\workout-runner.svelte generated by Svelte v3.37.0 */
+
+    function create_fragment$2(ctx) {
+    	let div;
+    	let switch_instance;
+    	let current;
+    	var switch_value = /*$current_component*/ ctx[1];
+
+    	function switch_props(ctx) {
+    		return {
+    			props: {
+    				done: /*finishState*/ ctx[6],
+    				state: /*$current_state*/ ctx[0]
+    			}
+    		};
+    	}
+
+    	if (switch_value) {
+    		switch_instance = new switch_value(switch_props(ctx));
+    	}
+
+    	return {
+    		c() {
+    			div = element("div");
+    			if (switch_instance) create_component(switch_instance.$$.fragment);
+    		},
+    		m(target, anchor) {
+    			insert(target, div, anchor);
+
+    			if (switch_instance) {
+    				mount_component(switch_instance, div, null);
+    			}
+
+    			current = true;
+    		},
+    		p(ctx, [dirty]) {
+    			const switch_instance_changes = {};
+    			if (dirty & /*$current_state*/ 1) switch_instance_changes.state = /*$current_state*/ ctx[0];
+
+    			if (switch_value !== (switch_value = /*$current_component*/ ctx[1])) {
+    				if (switch_instance) {
+    					group_outros();
+    					const old_component = switch_instance;
+
+    					transition_out(old_component.$$.fragment, 1, 0, () => {
+    						destroy_component(old_component, 1);
+    					});
+
+    					check_outros();
+    				}
+
+    				if (switch_value) {
+    					switch_instance = new switch_value(switch_props(ctx));
+    					create_component(switch_instance.$$.fragment);
+    					transition_in(switch_instance.$$.fragment, 1);
+    					mount_component(switch_instance, div, null);
+    				} else {
+    					switch_instance = null;
+    				}
+    			} else if (switch_value) {
+    				switch_instance.$set(switch_instance_changes);
+    			}
+    		},
+    		i(local) {
+    			if (current) return;
+    			if (switch_instance) transition_in(switch_instance.$$.fragment, local);
+    			current = true;
+    		},
+    		o(local) {
+    			if (switch_instance) transition_out(switch_instance.$$.fragment, local);
+    			current = false;
+    		},
+    		d(detaching) {
+    			if (detaching) detach(div);
+    			if (switch_instance) destroy_component(switch_instance);
+    		}
+    	};
+    }
+
+    function instance$2($$self, $$props, $$invalidate) {
+    	let $active_workout;
+    	let $workout_queue;
+    	let $current_state;
+    	let $current_component;
+    	let { ctx } = $$props;
+    	let current_state = writable(states.INIT);
+    	component_subscribe($$self, current_state, value => $$invalidate(0, $current_state = value));
+    	let current_component = writable();
+    	component_subscribe($$self, current_component, value => $$invalidate(1, $current_component = value));
+
+    	//Active workout is the entire object
+    	let active_workout = writable();
+
+    	component_subscribe($$self, active_workout, value => $$invalidate(8, $active_workout = value));
+
+    	//Workout queue is just a queue of the activties we need to do
+    	let workout_queue = writable();
+
+    	component_subscribe($$self, workout_queue, value => $$invalidate(9, $workout_queue = value));
+
+    	//Get the workout by ID and load it into active workout
+    	onMount(() => {
+    		let curr = JSON.parse(localStorage.getItem("routine_list"));
+    		console.log("Starting new workout at ID:", ctx.id);
+    		let workout = JSON.parse(curr[ctx.id]);
+    		set_store_value(active_workout, $active_workout = workout, $active_workout);
+    		set_store_value(workout_queue, $workout_queue = workout.activities, $workout_queue);
+    	});
+
+    	switch ($current_state) {
+    		case states.SWITCHING:
+    			set_store_value(current_component, $current_component = Instructor, $current_component);
+    			break;
+    		case states.CALIBRATING:
+    			set_store_value(current_component, $current_component = Calibrate, $current_component);
+    			break;
+    		case states.INIT:
+    			set_store_value(current_component, $current_component = Instructor, $current_component);
+    	}
+
+    	//Called by a state component when it has finished doing its thing
+    	function finishState() {
+    		console.log("Finished step:", states[$current_state]);
+
+    		switch ($current_state) {
+    			case states.INIT:
+    				set_store_value(current_state, $current_state = states.CALIBRATING, $current_state);
+    				set_store_value(current_component, $current_component = Calibrate, $current_component);
+    				break;
+    		}
+    	}
+
+    	$$self.$$set = $$props => {
+    		if ("ctx" in $$props) $$invalidate(7, ctx = $$props.ctx);
+    	};
+
+    	return [
+    		$current_state,
+    		$current_component,
+    		current_state,
+    		current_component,
+    		active_workout,
+    		workout_queue,
+    		finishState,
+    		ctx
+    	];
+    }
+
+    class Workout_runner extends SvelteComponent {
+    	constructor(options) {
+    		super();
+    		init(this, options, instance$2, create_fragment$2, safe_not_equal, { ctx: 7 });
+    	}
+    }
+
     /* src\router.svelte generated by Svelte v3.37.0 */
 
     function get_each_context(ctx, list, i) {
     	const child_ctx = ctx.slice();
-    	child_ctx[3] = list[i];
+    	child_ctx[6] = list[i];
     	return child_ctx;
     }
 
-    // (46:4) {#each routes as route}
-    function create_each_block(ctx) {
+    // (114:4) {#if route.show != false}
+    function create_if_block$1(ctx) {
     	let routeritem;
     	let current;
 
     	routeritem = new Router_item({
     			props: {
-    				active: /*route*/ ctx[3].path == /*$current_route*/ ctx[1].path,
-    				path: /*route*/ ctx[3].path,
-    				label: /*route*/ ctx[3].label,
-    				icon: /*route*/ ctx[3].icon
+    				active: /*route*/ ctx[6].path == /*$current_route*/ ctx[2].path,
+    				path: /*route*/ ctx[6].path,
+    				label: /*route*/ ctx[6].label,
+    				icon: /*route*/ ctx[6].icon
     			}
     		});
 
@@ -858,7 +2795,7 @@ var app = (function () {
     		},
     		p(ctx, dirty) {
     			const routeritem_changes = {};
-    			if (dirty & /*$current_route*/ 2) routeritem_changes.active = /*route*/ ctx[3].path == /*$current_route*/ ctx[1].path;
+    			if (dirty & /*$current_route*/ 4) routeritem_changes.active = /*route*/ ctx[6].path == /*$current_route*/ ctx[2].path;
     			routeritem.$set(routeritem_changes);
     		},
     		i(local) {
@@ -876,12 +2813,47 @@ var app = (function () {
     	};
     }
 
+    // (113:4) {#each routes as route}
+    function create_each_block(ctx) {
+    	let if_block_anchor;
+    	let current;
+    	let if_block = /*route*/ ctx[6].show != false && create_if_block$1(ctx);
+
+    	return {
+    		c() {
+    			if (if_block) if_block.c();
+    			if_block_anchor = empty();
+    		},
+    		m(target, anchor) {
+    			if (if_block) if_block.m(target, anchor);
+    			insert(target, if_block_anchor, anchor);
+    			current = true;
+    		},
+    		p(ctx, dirty) {
+    			if (/*route*/ ctx[6].show != false) if_block.p(ctx, dirty);
+    		},
+    		i(local) {
+    			if (current) return;
+    			transition_in(if_block);
+    			current = true;
+    		},
+    		o(local) {
+    			transition_out(if_block);
+    			current = false;
+    		},
+    		d(detaching) {
+    			if (if_block) if_block.d(detaching);
+    			if (detaching) detach(if_block_anchor);
+    		}
+    	};
+    }
+
     function create_fragment$1(ctx) {
     	let div;
     	let t1;
     	let ul;
     	let current;
-    	let each_value = /*routes*/ ctx[2];
+    	let each_value = /*routes*/ ctx[3];
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
@@ -918,8 +2890,8 @@ var app = (function () {
     			current = true;
     		},
     		p(ctx, [dirty]) {
-    			if (dirty & /*routes, $current_route*/ 6) {
-    				each_value = /*routes*/ ctx[2];
+    			if (dirty & /*routes, $current_route*/ 12) {
+    				each_value = /*routes*/ ctx[3];
     				let i;
 
     				for (i = 0; i < each_value.length; i += 1) {
@@ -975,60 +2947,124 @@ var app = (function () {
     function instance$1($$self, $$props, $$invalidate) {
     	let $current_route,
     		$$unsubscribe_current_route = noop,
-    		$$subscribe_current_route = () => ($$unsubscribe_current_route(), $$unsubscribe_current_route = subscribe(current_route, $$value => $$invalidate(1, $current_route = $$value)), current_route);
+    		$$subscribe_current_route = () => ($$unsubscribe_current_route(), $$unsubscribe_current_route = subscribe(current_route, $$value => $$invalidate(2, $current_route = $$value)), current_route);
+
+    	let $route_ctx,
+    		$$unsubscribe_route_ctx = noop,
+    		$$subscribe_route_ctx = () => ($$unsubscribe_route_ctx(), $$unsubscribe_route_ctx = subscribe(route_ctx, $$value => $$invalidate(4, $route_ctx = $$value)), route_ctx);
 
     	$$self.$$.on_destroy.push(() => $$unsubscribe_current_route());
+    	$$self.$$.on_destroy.push(() => $$unsubscribe_route_ctx());
 
     	const routes = [
     		{
     			"path": "/",
     			"label": "Home",
     			"icon": "home",
-    			"component": Live_readout
+    			"component": Live_readout,
+    			"show": true
     		},
     		{
     			"path": "/workouts",
-    			"label": "Workouts",
+    			"label": "Workout History",
     			"icon": "fitness_center",
-    			"component": Workouts
+    			"component": Workouts,
+    			"show": true
     		},
     		{
     			"path": "/settings",
     			"label": "Settings",
     			"icon": "settings",
-    			"component": Live_readout
+    			"component": Live_readout,
+    			"show": true
     		},
     		{
     			"path": "/live-readout",
     			"label": "Live Readout",
     			"icon": "whatshot",
-    			"component": Live_readout
+    			"component": Live_readout,
+    			"show": true
+    		},
+    		{
+    			"path": "/create-workout",
+    			"label": "Create a Routine",
+    			"icon": "add",
+    			"component": Create_workout,
+    			"middlewares": [createWorkout],
+    			"show": true
+    		},
+    		{
+    			"path": "/create-workout/:id",
+    			"component": Create_workout,
+    			"show": false
+    		},
+    		{
+    			"path": "/run-workout/:id",
+    			"component": Workout_runner,
+    			"show": false
+    		},
+    		{
+    			"path": "/view-routines",
+    			"label": "View/Start Routines",
+    			"icon": "view_headline",
+    			"component": View_workouts,
+    			"show": true
     		}
     	];
 
+    	function createWorkout(ctx, next) {
+    		let id = v4();
+    		ctx.id = id;
+    		let curr = JSON.parse(localStorage.getItem("routine_list"));
+
+    		if (!curr) {
+    			curr = {};
+    		}
+
+    		curr[id] = JSON.stringify({
+    			"name": "My Cool Workout",
+    			"activities": [],
+    			"times_performed": 0
+    		});
+
+    		localStorage.setItem("routine_list", JSON.stringify(curr));
+    		page.redirect("/create-workout/" + id);
+    	}
+
     	let { current_route = routes[0] } = $$props;
     	$$subscribe_current_route();
+    	let { route_ctx = {} } = $$props;
+    	$$subscribe_route_ctx();
     	page.base("");
 
     	routes.forEach(element => {
-    		page(element.path, () => {
-    			set_store_value(current_route, $current_route = element, $current_route);
-    		});
+    		if (element.middlewares) {
+    			page(element.path, ...element.middlewares, (ctx, next) => {
+    				set_store_value(current_route, $current_route = element, $current_route);
+    				set_store_value(route_ctx, $route_ctx = ctx.params, $route_ctx);
+    			});
+    		} else {
+    			page(element.path, ctx => {
+    				set_store_value(current_route, $current_route = element, $current_route);
+    				set_store_value(route_ctx, $route_ctx = ctx.params, $route_ctx);
+    			});
+    		}
     	});
 
     	page();
 
     	$$self.$$set = $$props => {
     		if ("current_route" in $$props) $$subscribe_current_route($$invalidate(0, current_route = $$props.current_route));
+    		if ("route_ctx" in $$props) $$subscribe_route_ctx($$invalidate(1, route_ctx = $$props.route_ctx));
     	};
 
-    	return [current_route, $current_route, routes];
+    	return [current_route, route_ctx, $current_route, routes];
     }
 
     class Router extends SvelteComponent {
     	constructor(options) {
     		super();
-    		init(this, options, instance$1, create_fragment$1, safe_not_equal, { current_route: 0 });
+    		init(this, options, instance$1, create_fragment$1, safe_not_equal, { current_route: 0, route_ctx: 1 });
     	}
     }
 
@@ -1038,11 +3074,14 @@ var app = (function () {
     	let switch_instance;
     	let switch_instance_anchor;
     	let current;
-    	var switch_value = /*$current_route*/ ctx[2].component;
+    	var switch_value = /*$current_route*/ ctx[3].component;
 
     	function switch_props(ctx) {
     		return {
-    			props: { current_flex: /*$current_flex*/ ctx[3] }
+    			props: {
+    				current_flex: /*$current_flex*/ ctx[2],
+    				ctx: /*$route_ctx*/ ctx[4]
+    			}
     		};
     	}
 
@@ -1065,9 +3104,10 @@ var app = (function () {
     		},
     		p(ctx, dirty) {
     			const switch_instance_changes = {};
-    			if (dirty & /*$current_flex*/ 8) switch_instance_changes.current_flex = /*$current_flex*/ ctx[3];
+    			if (dirty & /*$current_flex*/ 4) switch_instance_changes.current_flex = /*$current_flex*/ ctx[2];
+    			if (dirty & /*$route_ctx*/ 16) switch_instance_changes.ctx = /*$route_ctx*/ ctx[4];
 
-    			if (switch_value !== (switch_value = /*$current_route*/ ctx[2].component)) {
+    			if (switch_value !== (switch_value = /*$current_route*/ ctx[3].component)) {
     				if (switch_instance) {
     					group_outros();
     					const old_component = switch_instance;
@@ -1113,12 +3153,17 @@ var app = (function () {
     	let div0;
     	let router;
     	let updating_current_route;
+    	let updating_route_ctx;
     	let t;
     	let div1;
     	let current;
 
     	function router_current_route_binding(value) {
-    		/*router_current_route_binding*/ ctx[4](value);
+    		/*router_current_route_binding*/ ctx[5](value);
+    	}
+
+    	function router_route_ctx_binding(value) {
+    		/*router_route_ctx_binding*/ ctx[6](value);
     	}
 
     	let router_props = {};
@@ -1127,8 +3172,13 @@ var app = (function () {
     		router_props.current_route = /*current_route*/ ctx[0];
     	}
 
+    	if (/*route_ctx*/ ctx[1] !== void 0) {
+    		router_props.route_ctx = /*route_ctx*/ ctx[1];
+    	}
+
     	router = new Router({ props: router_props });
     	binding_callbacks.push(() => bind(router, "current_route", router_current_route_binding));
+    	binding_callbacks.push(() => bind(router, "route_ctx", router_route_ctx_binding));
     	let if_block = /*current_route*/ ctx[0] != undefined && create_if_block(ctx);
 
     	return {
@@ -1161,6 +3211,12 @@ var app = (function () {
     				updating_current_route = true;
     				router_changes.current_route = /*current_route*/ ctx[0];
     				add_flush_callback(() => updating_current_route = false);
+    			}
+
+    			if (!updating_route_ctx && dirty & /*route_ctx*/ 2) {
+    				updating_route_ctx = true;
+    				router_changes.route_ctx = /*route_ctx*/ ctx[1];
+    				add_flush_callback(() => updating_route_ctx = false);
     			}
 
     			router.$set(router_changes);
@@ -1208,24 +3264,27 @@ var app = (function () {
     }
 
     function instance($$self, $$props, $$invalidate) {
+    	let $current_flex;
+
     	let $current_route,
     		$$unsubscribe_current_route = noop,
-    		$$subscribe_current_route = () => ($$unsubscribe_current_route(), $$unsubscribe_current_route = subscribe(current_route, $$value => $$invalidate(2, $current_route = $$value)), current_route);
+    		$$subscribe_current_route = () => ($$unsubscribe_current_route(), $$unsubscribe_current_route = subscribe(current_route, $$value => $$invalidate(3, $current_route = $$value)), current_route);
 
-    	let $current_flex,
-    		$$unsubscribe_current_flex = noop,
-    		$$subscribe_current_flex = () => ($$unsubscribe_current_flex(), $$unsubscribe_current_flex = subscribe(current_flex, $$value => $$invalidate(3, $current_flex = $$value)), current_flex);
+    	let $route_ctx,
+    		$$unsubscribe_route_ctx = noop,
+    		$$subscribe_route_ctx = () => ($$unsubscribe_route_ctx(), $$unsubscribe_route_ctx = subscribe(route_ctx, $$value => $$invalidate(4, $route_ctx = $$value)), route_ctx);
 
+    	component_subscribe($$self, current_flex, $$value => $$invalidate(2, $current_flex = $$value));
     	$$self.$$.on_destroy.push(() => $$unsubscribe_current_route());
-    	$$self.$$.on_destroy.push(() => $$unsubscribe_current_flex());
+    	$$self.$$.on_destroy.push(() => $$unsubscribe_route_ctx());
     	let { current_route = writable({}) } = $$props; //Maintained in global scope 
     	$$subscribe_current_route();
-    	let { current_flex = writable(0) } = $$props;
-    	$$subscribe_current_flex();
+    	let { route_ctx = writable({}) } = $$props;
+    	$$subscribe_route_ctx();
     	let socket = new WebSocket("ws://localhost:3000");
 
     	socket.onmessage = event => {
-    		$$subscribe_current_flex($$invalidate(1, current_flex = event.data));
+    		set_store_value(current_flex, $current_flex = event.data, $current_flex);
     	};
 
     	function router_current_route_binding(value) {
@@ -1233,24 +3292,31 @@ var app = (function () {
     		$$subscribe_current_route($$invalidate(0, current_route));
     	}
 
+    	function router_route_ctx_binding(value) {
+    		route_ctx = value;
+    		$$subscribe_route_ctx($$invalidate(1, route_ctx));
+    	}
+
     	$$self.$$set = $$props => {
     		if ("current_route" in $$props) $$subscribe_current_route($$invalidate(0, current_route = $$props.current_route));
-    		if ("current_flex" in $$props) $$subscribe_current_flex($$invalidate(1, current_flex = $$props.current_flex));
+    		if ("route_ctx" in $$props) $$subscribe_route_ctx($$invalidate(1, route_ctx = $$props.route_ctx));
     	};
 
     	return [
     		current_route,
-    		current_flex,
-    		$current_route,
+    		route_ctx,
     		$current_flex,
-    		router_current_route_binding
+    		$current_route,
+    		$route_ctx,
+    		router_current_route_binding,
+    		router_route_ctx_binding
     	];
     }
 
     class App extends SvelteComponent {
     	constructor(options) {
     		super();
-    		init(this, options, instance, create_fragment, safe_not_equal, { current_route: 0, current_flex: 1 });
+    		init(this, options, instance, create_fragment, safe_not_equal, { current_route: 0, route_ctx: 1 });
     	}
     }
 
