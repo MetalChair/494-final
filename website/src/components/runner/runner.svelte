@@ -2,7 +2,7 @@
     import { onMount } from "svelte";
     import { cubicOut, elasticOut } from 'svelte/easing'
     import {current_flex} from "../stores"
-    import { fly } from 'svelte/transition'
+    import { fly, fade } from 'svelte/transition'
     export let data = {};
     let resolve, reject;
     let button_promise = new Promise((_resolve, _reject) =>{
@@ -141,20 +141,6 @@
         console.log([...data.workout_queue])
         data.workout_queue = [...data.workout_queue.slice(1)]
         console.log([...data.workout_queue])
-
-        // let elem = document.querySelector(".queue-card-container").firstElementChild
-        
-        // elem.classList.add("out")
-        // elem.addEventListener("transitionend", ()=>{
-        //     elem.remove()
-        //     let newelem = document.querySelector(".queue-card-container").firstElementChild
-        //     if(newelem)
-        //         newelem.style = ""
-        //     console.log(data.workout_queue)
-        //     data.workout_queue = data.workout_queue
-
-        // })
-        // data.workout_queue.shift
     }
 
 </script>
@@ -173,11 +159,11 @@
         margin: auto;
         border-radius: 5px;
         text-align: center;
-    }
-    .out{
-        transform-origin: bottom;
-        transform: rotateZ(-10deg) !important;
-        opacity: 0;
+        padding: 5px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
     }
     .queue-card-container{
         justify-content: center;
@@ -188,9 +174,8 @@
         position: relative;
     }
 </style>
-<button on:click={iterateActivity} class ="btn">Iterate</button>
-<br class = "out">
-<div class = "workouts-container queue-card-container">
+<br class>
+<div out:fade class = "workouts-container queue-card-container">
     {#each data.workout_queue as item, i (item.key)}
         <div
             class = "card queue-card" 
@@ -201,9 +186,24 @@
             out:rotateOut
             in:fly="{{duration: 1000,delay: 10 * i, easing: elasticOut, y: 100}}"
              >
-            {item.name}<br>
+            <h4><b>{item.name}</b></h4><br>
             {#if item.reps_remaining }
-                {item.reps_remaining} left!
+                <h3><b>{item.reps_remaining} left!</b></h3>
+            {/if}
+            {#if item.image }
+                <img alt = "BicepCurlGif" src = {item.image}>
+            {/if}
+            <div>
+                {#if item.desc}
+                    {item.desc}
+                {/if}
+            </div>
+            {#if item.display_props}
+                {#each Object.entries(item.display_props) as [key, value]}
+                    <div>
+                        {value} {item.editable_props[key]}
+                    </div>
+                {/each}
             {/if}
             {#if item.use_flex === false && i == 0}
                 <button class = "btn" on:click="{resolveExercise}">Done!</button>

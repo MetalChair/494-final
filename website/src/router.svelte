@@ -26,22 +26,22 @@
             "show": true
 
         },
-        {
-            "path" : "/settings",
-            "label" : "Settings",
-            "icon" : "settings",
-            "component": LiveRead,
-            "show": true
+        // {
+        //     "path" : "/settings",
+        //     "label" : "Settings",
+        //     "icon" : "settings",
+        //     "component": LiveRead,
+        //     "show": true
 
-        },
-        {
-            "path" : "/live-readout",
-            "label" : "Live Readout",
-            "icon" : "whatshot",
-            "component": LiveRead,
-            "show": true
+        // },
+        // {
+        //     "path" : "/live-readout",
+        //     "label" : "Live Readout",
+        //     "icon" : "whatshot",
+        //     "component": LiveRead,
+        //     "show": true
 
-        },
+        // },
   
         {
             "path" : "/create-workout",

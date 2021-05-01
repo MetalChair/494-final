@@ -88,12 +88,26 @@ import {current_flex, sensor_data } from "../stores"
     }
 
 </script>
-{#if current_state === CALIBRATE_STATES.STRAIGHT}
-    Calibrating Sensor... Hold Arm Straight
-{:else if current_state === CALIBRATE_STATES.WAITING_FOR_FLEX}
-    Now flex the sensor 
-{:else if current_state === CALIBRATE_STATES.FLEXED}
-    Hold that position :)
-{:else if current_state === CALIBRATE_STATES.DONE}
-    All Done :)))))
-{/if}
+<style>
+    .status-container{
+        display: flex;
+        width: 100%;
+        height: 100%;
+        justify-content: center;
+        align-items: center;
+        flex-direction: column;
+    }
+</style>
+<div class = "status-container">
+    {#if current_state === CALIBRATE_STATES.STRAIGHT}
+        <h4>Calibrating Sensor... Hold Arm Straight </h4>
+    {:else if current_state === CALIBRATE_STATES.WAITING_FOR_FLEX}
+        <h4>Now flex the sensor </h4>
+    {:else if current_state === CALIBRATE_STATES.FLEXED}
+        <h4>Hold that position</h4>
+    {:else if current_state === CALIBRATE_STATES.DONE}
+        <div><h4>All Done</h4></div>
+        <div><h4>Starting your workout</h4></div>
+    {/if}
+</div>
+
